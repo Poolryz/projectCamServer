@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+opencv-python
+numpy
+aiortc
+websockets
+requests
+python-multipart
+pydantic
+pydantic-settings
+python-dotenv
+aiofiles
+pillow
