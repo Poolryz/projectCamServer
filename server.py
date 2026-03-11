@@ -13,8 +13,7 @@ from controller.ESP8266 import ESP8266Controller
 from videoProcessor.videoProcessor import ImprovedVideoProcessor
 # Импортируем FastAPI модули
 from fastApi.fastApi import (
-    run_fastapi, update_system_state, 
-    encode_frame_to_base64, system_state
+    run_fastapi
 )
 
 # =================== ОСНОВНАЯ ПРОГРАММА ===================
