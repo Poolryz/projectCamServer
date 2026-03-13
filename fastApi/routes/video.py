@@ -34,6 +34,55 @@ async def video_feed(request: Request):
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
+@router.get("/processed/feed")
+async def processed_video_feed(request: Request):
+    """Endpoint для MJPEG потока обработанных кадров (то, что раньше показывалось в cv2.imshow)."""
+    processed_stream = request.app.state.processed_stream
+
+    async def generate():
+        while True:
+            frame = processed_stream.get_frame()
+            if frame is not None:
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+                ret, buffer = cv2.imencode(".jpg", frame, encode_params)
+                if ret:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + buffer.tobytes()
+                        + b"\r\n"
+                    )
+            await asyncio.sleep(0.03)  # ~30 FPS
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+@router.get("/processed/frame")
+async def get_processed_frame(request: Request):
+    """Получение одного обработанного кадра в base64."""
+    processed_stream = request.app.state.processed_stream
+    frame = processed_stream.get_frame()
+
+    if frame is not None:
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+        _, buffer = cv2.imencode(".jpg", frame, encode_params)
+        frame_base64 = base64.b64encode(buffer).decode("utf-8")
+
+        return {
+            "success": True,
+            "frame": frame_base64,
+            "timestamp": time.time(),
+            "shape": frame.shape,
+        }
+
+    return {
+        "success": False,
+        "error": "No processed frame available",
+        "timestamp": time.time(),
+    }
+
 @router.get("/frame")
 async def get_frame(request: Request):
     """Получение одного кадра в base64"""
@@ -75,3 +124,9 @@ async def get_status(request: Request):
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint для отправки кадров"""
     await websocket_video(websocket)
+
+
+@router.websocket("/processed/ws")
+async def processed_websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint для отправки обработанных кадров (как в окне cv2)."""
+    await websocket_video(websocket, source="processed")

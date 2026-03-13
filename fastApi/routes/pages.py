@@ -33,7 +33,7 @@ async def get_home():
                         <li><a href="/video/frame">/video/frame</a> - Получить один кадр (JSON)</li>
                         <li><a href="/video/status">/video/status</a> - Статус видеопотока</li>
                         <li><a href="/health">/health</a> - Проверка здоровья</li>
-                        <li>ws://localhost:8000/ws/video - WebSocket поток</li>
+                        <li>ws://localhost:8000/video/ws - WebSocket поток</li>
                     </ul>
                 </div>
             </div>

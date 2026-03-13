@@ -3,21 +3,28 @@ import cv2
 import base64
 import time
 
-async def websocket_video(websocket: WebSocket):
+async def websocket_video(websocket: WebSocket, source: str = "raw"):
     """WebSocket обработчик для отправки кадров в base64"""
     await websocket.accept()
     print("WebSocket клиент подключен")
     
     try:
-        # Получаем доступ к видеопотоку через app state
-        video_stream = websocket.app.state.video_stream
+        # Получаем доступ к потоку через app state
+        if source == "processed":
+            stream = websocket.app.state.processed_stream
+        else:
+            stream = websocket.app.state.video_stream
         
         while True:
             # Ждем команду от клиента
             data = await websocket.receive_text()
             
             if data == "get_frame":
-                frame = video_stream.get_frame()
+                # processed_stream может вернуть еще и метаданные измерения
+                if hasattr(stream, "get_latest") and source == "processed":
+                    frame, meta = stream.get_latest()
+                else:
+                    frame, meta = stream.get_frame(), {}
                 if frame is not None:
                     # Уменьшаем размер кадра если нужно
                     height, width = frame.shape[:2]
@@ -39,12 +46,33 @@ async def websocket_video(websocket: WebSocket):
                         "data": frame_base64,
                         "timestamp": time.time(),
                         "width": new_width,
-                        "height": new_height
+                        "height": new_height,
+                        "source": source,
+                        "meta": meta,
+                    })
+                else:
+                    await websocket.send_json({
+                        "type": "frame",
+                        "data": None,
+                        "timestamp": time.time(),
+                        "source": source,
+                        "meta": meta,
                     })
             elif data == "ping":
                 await websocket.send_json({
                     "type": "pong", 
                     "timestamp": time.time()
+                })
+            elif data == "get_measurement":
+                if hasattr(stream, "get_meta") and source == "processed":
+                    meta = stream.get_meta()
+                else:
+                    meta = {}
+                await websocket.send_json({
+                    "type": "measurement",
+                    "timestamp": time.time(),
+                    "source": source,
+                    "meta": meta,
                 })
                 
     except WebSocketDisconnect:

@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import cv2
 import numpy as np
@@ -17,6 +17,8 @@ class ImprovedVideoProcessor:
         # НОВОЕ: Буфер для сглаживания измерений
         self.width_history = deque(maxlen=Config.WIDTH_HISTORY_SIZE)
         self.last_valid_width = None
+        self._ema_width: Optional[float] = None
+        self._last_edges: Optional[Tuple[float, float]] = None
 
         # НОВОЕ: Инициализация CLAHE для улучшения контраста
         self.clahe = cv2.createCLAHE(
@@ -64,6 +66,32 @@ class ImprovedVideoProcessor:
 
         return denoised
 
+    def build_metal_mask(self, hsv_mask: np.ndarray, enhanced_gray: np.ndarray) -> np.ndarray:
+        """
+        NEW: более стабильная маска металла.
+        Берём HSV как подсказку, но добавляем маску по яркости (Otsu) в полосе измерения.
+        Это помогает, когда HSV плохо отделяет металл/фон из-за ИК/освещения.
+        """
+        if self.measure_y is None:
+            return hsv_mask
+
+        h, w = enhanced_gray.shape[:2]
+        y0 = max(0, int(self.measure_y - Config.MEASURE_BAND_HALF_HEIGHT))
+        y1 = min(h, int(self.measure_y + Config.MEASURE_BAND_HALF_HEIGHT))
+
+        band = enhanced_gray[y0:y1, :]
+        # Otsu по полосе (стабильнее чем по всему кадру)
+        _, thr = cv2.threshold(band, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        intensity_mask = np.zeros_like(hsv_mask)
+        intensity_mask[y0:y1, :] = thr
+
+        # Объединяем (OR) и чистим морфологией
+        combined = cv2.bitwise_or(hsv_mask, intensity_mask)
+        k = np.ones((Config.MASK_MORPH_KERNEL, Config.MASK_MORPH_KERNEL), np.uint8)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k)
+        return combined
+
     def detect_edges_accurately(self, enhanced: np.ndarray, hsv_mask: np.ndarray) -> np.ndarray:
         """НОВЫЙ: Точное определение границ с помощью комбинации методов"""
         # Детекция границ методом Canny
@@ -78,18 +106,26 @@ class ImprovedVideoProcessor:
 
         return closed_edges
 
-    def measure_width_improved(self, hsv_mask: np.ndarray, enhanced: np.ndarray,
-                              frame: np.ndarray) -> Optional[float]:
+    def measure_width_improved(
+        self,
+        hsv_mask: np.ndarray,
+        enhanced: np.ndarray,
+        frame: np.ndarray,
+    ) -> Tuple[Optional[float], Dict[str, Any]]:
         """НОВЫЙ: Улучшенный алгоритм измерения ширины"""
         if self.measure_y is None or self.measure_right is None:
-            return None
+            return None, {"ok": False, "reason": "not_initialized"}
 
         # Получаем строку для анализа
         roi_mask = hsv_mask[self.measure_y, Config.MEASURE_LEFT:self.measure_right]
         roi_enhanced = enhanced[self.measure_y, Config.MEASURE_LEFT:self.measure_right]
 
         # Сглаживание сигнала
-        roi_smooth = cv2.GaussianBlur(roi_enhanced.astype(np.float32), (1, 5), 1).flatten()
+        roi_smooth = cv2.GaussianBlur(
+            roi_enhanced.astype(np.float32),
+            (1, Config.PROFILE_GAUSS_KERNEL),
+            Config.PROFILE_GAUSS_SIGMA,
+        ).flatten()
 
         # Нормализация
         if np.max(roi_smooth) > np.min(roi_smooth):
@@ -101,12 +137,12 @@ class ImprovedVideoProcessor:
         coords_mask = np.where(roi_mask > 0)[0]
 
         if len(coords_mask) == 0:
-            return None
+            return None, {"ok": False, "reason": "mask_empty"}
 
         # Точное определение левой границы
         left_approx = coords_mask[0]
-        left_start = max(0, left_approx - 15)
-        left_end = min(left_approx + 15, len(roi_norm))
+        left_start = max(0, left_approx - Config.EDGE_SEARCH_HALF_WINDOW)
+        left_end = min(left_approx + Config.EDGE_SEARCH_HALF_WINDOW, len(roi_norm))
         left_region = slice(left_start, left_end)
         left_edge = self.find_edge_position(roi_norm[left_region],
                                   left_start,  # Передаем смещение, а не search_region_left.start
@@ -114,43 +150,93 @@ class ImprovedVideoProcessor:
 
         # Точное определение правой границы
         right_approx = coords_mask[-1]
-        right_start = max(0, right_approx - 15)
-        right_end = min(right_approx + 15, len(roi_norm))
+        right_start = max(0, right_approx - Config.EDGE_SEARCH_HALF_WINDOW)
+        right_end = min(right_approx + Config.EDGE_SEARCH_HALF_WINDOW, len(roi_norm))
         right_region = slice(right_start, right_end)
         right_edge = self.find_edge_position(roi_norm[right_region],
                                    right_start,  # Передаем смещение, а не search_region_right.start
                                    edge_type='falling')
 
         if left_edge is None or right_edge is None:
-            return None
+            return None, {"ok": False, "reason": "edge_not_found"}
 
         # Вычисление ширины в пикселях
         width_px = right_edge - left_edge
+        if width_px <= 0:
+            return None, {"ok": False, "reason": "invalid_width_px", "width_px": float(width_px)}
         width_mm = width_px / self.px_to_mm
+
+        # Быстрая отбраковка выбросов по сравнению с последним значением
+        if self._ema_width is not None:
+            if abs(width_mm - self._ema_width) > Config.MAX_OUTLIER_DELTA_MM:
+                return None, {
+                    "ok": False,
+                    "reason": "outlier_rejected",
+                    "width_mm_raw": float(width_mm),
+                    "width_mm_ref": float(self._ema_width),
+                }
 
         # Визуализация
         left_abs = Config.MEASURE_LEFT + left_edge
         right_abs = Config.MEASURE_LEFT + right_edge
 
         # Рисуем точные границы
-        cv2.line(frame, (left_abs, self.measure_y - 20),
-                (left_abs, self.measure_y + 20), (0, 255, 0), 3)
-        cv2.line(frame, (right_abs, self.measure_y - 20),
-                (right_abs, self.measure_y + 20), (0, 255, 0), 3)
+        cv2.line(
+            frame,
+            (int(round(left_abs)), self.measure_y - 20),
+            (int(round(left_abs)), self.measure_y + 20),
+            (0, 255, 0),
+            3,
+        )
+        cv2.line(
+            frame,
+            (int(round(right_abs)), self.measure_y - 20),
+            (int(round(right_abs)), self.measure_y + 20),
+            (0, 255, 0),
+            3,
+        )
 
         # Рисуем линию профиля интенсивности
-        self.draw_intensity_profile(frame, roi_norm, left_edge, right_edge)
+        self.draw_intensity_profile(frame, roi_norm, int(round(left_edge)), int(round(right_edge)))
 
-        # Сглаживание измерений
-        self.width_history.append(width_mm)
-        smoothed_width = np.mean(self.width_history) if self.width_history else width_mm
+        # Сглаживание измерений: EMA + короткое среднее (устойчивость, но сохраняем "0.01")
+        if self._ema_width is None:
+            self._ema_width = float(width_mm)
+        else:
+            a = Config.EMA_ALPHA
+            self._ema_width = (1 - a) * self._ema_width + a * float(width_mm)
+
+        self.width_history.append(self._ema_width)
+        smoothed_width = float(np.mean(self.width_history)) if self.width_history else float(self._ema_width)
 
         self.last_valid_width = smoothed_width
         self.measurement_stats['valid_measurements'] += 1
 
-        return smoothed_width
+        self._last_edges = (float(left_edge), float(right_edge))
 
-    def find_edge_position(self, profile: np.ndarray, offset: int, edge_type: str = 'rising') -> Optional[int]:
+        # Оценка "уверенности": насколько выражен градиент в найденных окнах
+        grad = np.gradient(roi_norm)
+        lwin = slice(max(0, int(round(left_edge)) - 3), min(len(grad), int(round(left_edge)) + 4))
+        rwin = slice(max(0, int(round(right_edge)) - 3), min(len(grad), int(round(right_edge)) + 4))
+        l_strength = float(np.max(grad[lwin])) if (lwin.stop - lwin.start) > 0 else 0.0
+        r_strength = float(-np.min(grad[rwin])) if (rwin.stop - rwin.start) > 0 else 0.0
+        confidence = float(max(0.0, min(1.0, (l_strength + r_strength) / 2.0)))
+
+        return smoothed_width, {
+            "ok": True,
+            "width_mm_raw": float(width_mm),
+            "width_mm": float(smoothed_width),
+            "width_mm_2dp": float(round(smoothed_width, 2)),
+            "width_px": float(width_px),
+            "left_edge_px": float(left_abs),   # absolute in frame coordinates (float)
+            "right_edge_px": float(right_abs), # absolute in frame coordinates (float)
+            "left_edge_px_2dp": float(round(left_abs, 2)),
+            "right_edge_px_2dp": float(round(right_abs, 2)),
+            "measure_y": int(self.measure_y),
+            "confidence": confidence,
+        }
+
+    def find_edge_position(self, profile: np.ndarray, offset: int, edge_type: str = 'rising') -> Optional[float]:
         """НОВЫЙ: Точное определение позиции границы по профилю интенсивности"""
         if len(profile) == 0:
             return None
@@ -167,19 +253,19 @@ class ImprovedVideoProcessor:
 
         # Субпиксельная интерполяция для большей точности
         if 0 < edge_idx < len(gradient) - 1:
-            # Квадратичная интерполяция
+            # Квадратичная интерполяция (вершина параболы)
             try:
-                x0, x1, x2 = edge_idx - 1, edge_idx, edge_idx + 1
-                y0, y1, y2 = gradient[x0], gradient[x1], gradient[x2]
-
-                denominator = 2 * ((y2 - y1) - (y0 - y1))
-                if denominator != 0:
-                    offset_subpixel = (x1 - x0) * (y2 - y0) / denominator
-                    edge_idx = x0 + offset_subpixel
-            except:
+                y0 = float(gradient[edge_idx - 1])
+                y1 = float(gradient[edge_idx])
+                y2 = float(gradient[edge_idx + 1])
+                denom = (y0 - 2.0 * y1 + y2)
+                if denom != 0.0:
+                    delta = 0.5 * (y0 - y2) / denom
+                    edge_idx = float(edge_idx) + float(delta)
+            except Exception:
                 pass
 
-        return int(offset + edge_idx)
+        return float(offset) + float(edge_idx)
 
     def draw_intensity_profile(self, frame: np.ndarray, profile: np.ndarray,
                              left_edge: int, right_edge: int):
@@ -223,16 +309,22 @@ class ImprovedVideoProcessor:
         # 2. Улучшенная предобработка
         enhanced = self.preprocess_image(frame)
 
+        # 2.1 NEW: комбинированная маска (HSV + яркость в полосе)
+        metal_mask = self.build_metal_mask(hsv_mask, enhanced)
+
         # 3. Точное определение границ
-        edges = self.detect_edges_accurately(enhanced, hsv_mask)
+        edges = self.detect_edges_accurately(enhanced, metal_mask)
 
         # 4. Измерение ширины
-        width_mm = self.measure_width_improved(hsv_mask, enhanced, frame)
+        width_mm, meta = self.measure_width_improved(metal_mask, enhanced, frame)
 
         # 5. Визуализация
-        frame = self.visualize_results(frame, hsv_mask, edges, width_mm)
+        frame = self.visualize_results(frame, metal_mask, edges, width_mm)
 
-        return frame, width_mm
+        # meta может быть полезен для WebSocket
+        meta_out: Dict[str, Any] = {"timestamp": float(cv2.getTickCount() / cv2.getTickFrequency())}
+        meta_out.update(meta if isinstance(meta, dict) else {})
+        return frame, width_mm, meta_out
 
     def visualize_results(self, frame: np.ndarray, hsv_mask: np.ndarray,
                          edges: np.ndarray, width_mm: Optional[float]) -> np.ndarray:

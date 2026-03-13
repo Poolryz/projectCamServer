@@ -11,6 +11,7 @@ from config.config import Config
 from videoProcessor.videoProcessor import ImprovedVideoProcessor
 # Импортируем FastAPI модули
 from fastApi.main import run_fastapi
+from fastApi.services.processed_stream import ProcessedStream
 # =================== ОСНОВНАЯ ПРОГРАММА ===================
 def main():
     print("=" * 60)
@@ -29,6 +30,7 @@ def main():
     
     # Инициализация улучшенного видеопроцессора
     video_processor = ImprovedVideoProcessor()
+    processed_stream: Optional[ProcessedStream] = None
 
     if not video_processor.initialize():
         print("Не удалось инициализировать видеопоток. Завершение работы.")
@@ -48,7 +50,20 @@ def main():
             frame_count += 1
 
             # Обработка кадра с улучшенным алгоритмом
-            processed_frame, width_mm = video_processor.process_frame(frame)
+            processed_frame, width_mm, meta = video_processor.process_frame(frame)
+
+            # Пробрасываем кадр на FastAPI (для фронтенда)
+            if processed_stream is None:
+                # FastAPI запускается в этом же процессе, поэтому можем взять ссылку из app.state
+                try:
+                    from fastApi.main import app as fastapi_app  # локальный импорт чтобы избежать проблем импорта при старте
+                    processed_stream = getattr(fastapi_app.state, "processed_stream", None)
+                except Exception:
+                    processed_stream = None
+
+            if processed_stream is not None:
+                # meta отправим в WebSocket вместе с кадром
+                processed_stream.update(processed_frame, meta=meta)
 
             # Отображение порога
             cv2.putText(processed_frame, f"Threshold: {min_width_threshold:.1f}mm",
@@ -57,36 +72,6 @@ def main():
             # Отображение номера кадра
             cv2.putText(processed_frame, f"Frame: {frame_count}",
                        (50, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-            # Отображение кадра
-            cv2.imshow("Improved Metal Width Monitor", processed_frame)
-
-            # Обработка клавиш
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord('q'):  # Выход
-                break
-            elif key == ord('s'):  # Сохранение кадра
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                # Создаем директорию если её нет
-                os.makedirs(Config.SAVE_DIR, exist_ok=True)
-                filename = os.path.join(Config.SAVE_DIR, f"frame_{timestamp}_width_{width_mm:.1f}.jpg")
-                cv2.imwrite(filename, processed_frame)
-                print(f"Кадр сохранен: {filename}")
-            elif key == ord('r'):  # Сброс статистики
-                if hasattr(video_processor, 'measurement_stats'):
-                    video_processor.measurement_stats = {
-                        'total_measurements': 0,
-                        'valid_measurements': 0,
-                        'edges_detected': 0
-                    }
-                print("Статистика сброшена")
-            elif key == ord('+'):  # Увеличение порога
-                min_width_threshold += 0.5
-                print(f"Порог срабатывания: {min_width_threshold:.1f} мм")
-            elif key == ord('-'):  # Уменьшение порога
-                min_width_threshold = max(100, min_width_threshold - 0.5)
-                print(f"Порог срабатывания: {min_width_threshold:.1f} мм")
 
             # Небольшая задержка для уменьшения нагрузки на процессор
             time.sleep(0.01)
@@ -100,7 +85,6 @@ def main():
     finally:
         # Освобождение ресурсов
         video_processor.release()
-        cv2.destroyAllWindows()
         print("Ресурсы освобождены. Программа завершена.")
 
 if __name__ == "__main__":
