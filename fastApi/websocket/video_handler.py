@@ -8,6 +8,8 @@ from typing import Optional, Tuple
 import cv2
 from fastapi import WebSocket, WebSocketDisconnect
 
+from controller.ESP8266 import ESP8266Controller
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Монитор ширины металла
@@ -36,7 +38,7 @@ class WidthMonitor:
     reset_monitor   {}                        — сбросить в idle
     """
 
-    TOLERANCE_MM: float = 2.0
+    TOLERANCE_MM: float = 5.0
     CONFIRM_STABLE_FRAMES: int = 20   # сколько подряд стабильных кадров перед запросом
     CONFIRM_TIMEOUT_S: float = 15.0   # таймаут ожидания ответа клиента
     ALERT_DEBOUNCE_FRAMES: int = 5    # подряд кадров за границами перед тревогой
@@ -200,6 +202,7 @@ async def websocket_processed(websocket: WebSocket) -> None:
 
     stream = websocket.app.state.processed_stream
     monitor = WidthMonitor()
+    esp = ESP8266Controller()
 
     # Отправляем начальное состояние монитора
     await websocket.send_json({"type": "width_monitor_state", **monitor.state_dict()})
@@ -231,6 +234,11 @@ async def websocket_processed(websocket: WebSocket) -> None:
                     msg = monitor.process(float(width_mm), now)
                     if msg:
                         await websocket.send_json(msg)
+                        # Управление лампой: не блокирует цикл кадров
+                        if msg["type"] == "width_alert":
+                            asyncio.create_task(esp.alert_on())
+                        elif msg["type"] == "width_back_in_bounds":
+                            asyncio.create_task(esp.alert_off())
 
             await asyncio.sleep(1 / 25)
 

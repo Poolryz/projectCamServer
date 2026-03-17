@@ -1,89 +1,89 @@
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import requests
 from config.config import Config
 
+# Один фоновый поток для всех HTTP-запросов к ESP — не блокирует event loop
+_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="esp_http")
+
+
 # =================== КЛАСС ДЛЯ РАБОТЫ С ESP8266 ===================
 class ESP8266Controller:
-    def __init__(self, esp_ip: str = Config.ESP_IP, request_interval: int = Config.REQUEST_INTERVAL):
-        self.esp_ip = esp_ip
-        self.base_url = f"http://{esp_ip}"
-        self.toggle_url = f"{self.base_url}/toggle"
-        self.request_interval = request_interval
-        self.last_request_time = 0
-        self.request_count = 0
-        self.last_trigger_width = 0
+    """
+    Управляет лампой на ESP8266 через HTTP.
 
-    def send_toggle_request(self, width_mm: float = None) -> Dict:
-        """Отправляет запрос на переключение LED и возвращает результат"""
-        self.request_count += 1
+    Ключевые свойства
+    -----------------
+    - Использует явные эндпоинты /led/on и /led/off вместо /toggle,
+      поэтому лампа никогда не «дёргается».
+    - Запрос уходит в пул потоков (run_in_executor) — event loop не блокируется
+      и видео не подвисает.
+    - Повторный запрос отправляется только при смене состояния (OFF→ON или ON→OFF).
+    - Пока летит один запрос, дубликаты игнорируются.
+    """
+
+    def __init__(self, esp_ip: str = Config.ESP_IP) -> None:
+        self.base_url = f"http://{esp_ip}"
+        self._url_on  = f"{self.base_url}/led/on"
+        self._url_off = f"{self.base_url}/led/off"
+
+        self._led_on: bool = False      # последнее подтверждённое состояние
+        self._pending: bool = False     # идёт ли прямо сейчас HTTP-запрос
+        self._request_count: int = 0
+
+    # ── публичный async-интерфейс ─────────────────────────────────────────────
+
+    async def alert_on(self) -> None:
+        """Включить лампу — вызывать при выходе ширины за допуск."""
+        await self._set_led(True)
+
+    async def alert_off(self) -> None:
+        """Выключить лампу — вызывать когда ширина вернулась в норму."""
+        await self._set_led(False)
+
+    # ── внутренняя логика ─────────────────────────────────────────────────────
+
+    async def _set_led(self, on: bool) -> None:
+        if self._led_on == on:
+            return          # уже в нужном состоянии — ничего не делаем
+        if self._pending:
+            return          # запрос уже летит — не дублируем
+
+        self._pending = True
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(_executor, self._send_request, on)
+            if result["success"]:
+                self._led_on = on
+        finally:
+            self._pending = False
+
+    def _send_request(self, on: bool) -> Dict:
+        """Синхронный HTTP-запрос; выполняется в пуле потоков."""
+        self._request_count += 1
+        url = self._url_on if on else self._url_off
+        action = "ON" if on else "OFF"
         timestamp = datetime.now().strftime("%H:%M:%S")
 
+        print(f"[{timestamp}] ESP #{self._request_count}: LED {action} → {url}")
         try:
-            print(f"[{timestamp}] Запрос #{self.request_count}: Отправка на {self.toggle_url}")
-            if width_mm:
-                print(f"  Причина: Ширина {width_mm:.1f} мм")
-                self.last_trigger_width = width_mm
-
-            start_time = time.time()
-            response = requests.get(self.toggle_url, timeout=3)
-            elapsed_time = (time.time() - start_time) * 1000
+            t0 = time.time()
+            response = requests.get(url, timeout=3)
+            elapsed_ms = (time.time() - t0) * 1000
 
             if response.status_code in [200, 303]:
-                result = {
-                    'success': True,
-                    'status': 'LED toggled successfully',
-                    'status_code': response.status_code,
-                    'response_time': elapsed_time,
-                    'message': response.text[:50] if response.text else ''
-                }
+                print(f"  ✓ LED {action}  ({elapsed_ms:.0f} мс)")
+                return {"success": True, "elapsed_ms": elapsed_ms}
             else:
-                result = {
-                    'success': False,
-                    'status': f'HTTP error: {response.status_code}',
-                    'status_code': response.status_code,
-                    'response_time': elapsed_time
-                }
+                print(f"  ✗ HTTP {response.status_code}")
+                return {"success": False, "status_code": response.status_code}
 
-        except Exception as e:
-            result = {
-                'success': False,
-                'status': 'Request failed',
-                'error': str(e)
-            }
-
-        self.print_result(result)
-        self.last_request_time = time.time()
-        return result
-
-    def should_send_request(self, current_width: float, min_width: float = 134) -> bool:
-        """Проверяет, нужно ли отправлять запрос"""
-        # Проверка интервала времени
-        if time.time() - self.last_request_time < self.request_interval:
-            return False
-
-        # Проверка порога ширины
-        if current_width >= min_width:
-            return False
-
-        # Проверка, что ширина существенно изменилась с последнего срабатывания
-        if abs(current_width - self.last_trigger_width) < Config.MIN_WIDTH_CHANGE:
-            return False
-
-        return True
-
-    def print_result(self, result: Dict):
-        """Выводит результат запроса в консоль"""
-        if result['success']:
-            print(f"  ✓ {result['status']}")
-            if 'response_time' in result:
-                print(f"  Время ответа: {result['response_time']:.1f} мс")
-            if 'message' in result and result['message']:
-                print(f"  Ответ: {result['message']}")
-        else:
-            print(f"  ✗ {result['status']}")
-            if 'error' in result:
-                print(f"  Причина: {result['error']}")
-        print("-" * 50)
+        except Exception as exc:
+            print(f"  ✗ Ошибка: {exc}")
+            return {"success": False, "error": str(exc)}

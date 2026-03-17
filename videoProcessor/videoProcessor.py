@@ -215,12 +215,23 @@ class ImprovedVideoProcessor:
         self._last_edges = (float(left_edge), float(right_edge))
 
         # Оценка "уверенности": насколько выражен градиент в найденных окнах
+        # Нормируем на максимальный |градиент| по всему профилю, чтобы значение
+        # было в диапазоне [0, 1] независимо от масштаба яркости.
         grad = np.gradient(roi_norm)
-        lwin = slice(max(0, int(round(left_edge)) - 3), min(len(grad), int(round(left_edge)) + 4))
-        rwin = slice(max(0, int(round(right_edge)) - 3), min(len(grad), int(round(right_edge)) + 4))
-        l_strength = float(np.max(grad[lwin])) if (lwin.stop - lwin.start) > 0 else 0.0
-        r_strength = float(-np.min(grad[rwin])) if (rwin.stop - rwin.start) > 0 else 0.0
+        max_abs_grad = float(np.max(np.abs(grad))) + 1e-9
+        lwin = slice(max(0, int(round(left_edge)) - 5), min(len(grad), int(round(left_edge)) + 6))
+        rwin = slice(max(0, int(round(right_edge)) - 5), min(len(grad), int(round(right_edge)) + 6))
+        l_strength = float(np.max(grad[lwin])) / max_abs_grad if (lwin.stop - lwin.start) > 0 else 0.0
+        r_strength = float(-np.min(grad[rwin])) / max_abs_grad if (rwin.stop - rwin.start) > 0 else 0.0
         confidence = float(max(0.0, min(1.0, (l_strength + r_strength) / 2.0)))
+
+        if confidence < Config.MIN_CONFIDENCE_THRESHOLD:
+            return None, {
+                "ok": False,
+                "reason": "low_confidence",
+                "confidence": confidence,
+                "width_mm_raw": float(width_mm),
+            }
 
         return smoothed_width, {
             "ok": True,
