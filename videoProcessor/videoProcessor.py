@@ -106,67 +106,122 @@ class ImprovedVideoProcessor:
 
         return closed_edges
 
-    def measure_width_improved(
+    def _detect_edges_for_row(
         self,
+        row: int,
         hsv_mask: np.ndarray,
         enhanced: np.ndarray,
-        frame: np.ndarray,
-    ) -> Tuple[Optional[float], Dict[str, Any]]:
-        """НОВЫЙ: Улучшенный алгоритм измерения ширины"""
-        if self.measure_y is None or self.measure_right is None:
-            return None, {"ok": False, "reason": "not_initialized"}
+        left_bound: Optional[int] = None,
+        right_bound: Optional[int] = None,
+    ) -> Tuple[Optional[float], Optional[float], np.ndarray]:
+        """Вычисляет позиции левого и правого краёв для одной строки.
+        Возвращает (left_edge, right_edge, roi_norm)."""
+        lb = left_bound if left_bound is not None else Config.MEASURE_LEFT
+        rb = right_bound if right_bound is not None else self.measure_right
+        roi_mask = hsv_mask[row, lb:rb]
+        roi_enhanced = enhanced[row, lb:rb]
 
-        # Получаем строку для анализа
-        roi_mask = hsv_mask[self.measure_y, Config.MEASURE_LEFT:self.measure_right]
-        roi_enhanced = enhanced[self.measure_y, Config.MEASURE_LEFT:self.measure_right]
-
-        # Сглаживание сигнала
         roi_smooth = cv2.GaussianBlur(
             roi_enhanced.astype(np.float32),
             (1, Config.PROFILE_GAUSS_KERNEL),
             Config.PROFILE_GAUSS_SIGMA,
         ).flatten()
 
-        # Нормализация
-        if np.max(roi_smooth) > np.min(roi_smooth):
-            roi_norm = (roi_smooth - np.min(roi_smooth)) / (np.max(roi_smooth) - np.min(roi_smooth))
-        else:
-            roi_norm = roi_smooth
+        mn, mx = np.min(roi_smooth), np.max(roi_smooth)
+        roi_norm = (roi_smooth - mn) / (mx - mn) if mx > mn else roi_smooth
 
-        # Поиск границ с помощью маски HSV (грубое определение)
         coords_mask = np.where(roi_mask > 0)[0]
-
         if len(coords_mask) == 0:
-            return None, {"ok": False, "reason": "mask_empty"}
+            return None, None, roi_norm
 
-        # Точное определение левой границы
         left_approx = coords_mask[0]
         left_start = max(0, left_approx - Config.EDGE_SEARCH_HALF_WINDOW)
         left_end = min(left_approx + Config.EDGE_SEARCH_HALF_WINDOW, len(roi_norm))
-        left_region = slice(left_start, left_end)
-        left_edge = self.find_edge_position(roi_norm[left_region],
-                                  left_start,  # Передаем смещение, а не search_region_left.start
-                                  edge_type='rising')
+        left_edge = self.find_edge_position(
+            roi_norm[left_start:left_end], left_start, edge_type='rising')
 
-        # Точное определение правой границы
         right_approx = coords_mask[-1]
         right_start = max(0, right_approx - Config.EDGE_SEARCH_HALF_WINDOW)
         right_end = min(right_approx + Config.EDGE_SEARCH_HALF_WINDOW, len(roi_norm))
-        right_region = slice(right_start, right_end)
-        right_edge = self.find_edge_position(roi_norm[right_region],
-                                   right_start,  # Передаем смещение, а не search_region_right.start
-                                   edge_type='falling')
+        right_edge = self.find_edge_position(
+            roi_norm[right_start:right_end], right_start, edge_type='falling')
 
-        if left_edge is None or right_edge is None:
+        return left_edge, right_edge, roi_norm
+
+    def _compute_dynamic_bounds(
+        self,
+        metal_mask: np.ndarray,
+        frame_width: int,
+        pad: int = 60,
+    ) -> Tuple[int, int]:
+        """Вычисляет границы ROI по фактическому положению металла в полосе измерения.
+
+        Сканирует несколько строк вокруг measure_y и берёт крайние пиксели маски.
+        Это позволяет обнаруживать металл независимо от его горизонтального смещения.
+        """
+        half = Config.MEASURE_SCAN_LINES // 2
+        h = metal_mask.shape[0]
+        y0 = max(0, self.measure_y - half)
+        y1 = min(h, self.measure_y + half + 1)
+
+        band = metal_mask[y0:y1, :]
+        cols = np.where(band > 0)[1]
+        if len(cols) > 0:
+            left_bound = max(0, int(cols.min()) - pad)
+            right_bound = min(frame_width, int(cols.max()) + pad)
+        else:
+            # Металл не найден в полосе — используем стандартные границы
+            left_bound = Config.MEASURE_LEFT
+            right_bound = self.measure_right
+        return left_bound, right_bound
+
+    def measure_width_improved(
+        self,
+        hsv_mask: np.ndarray,
+        enhanced: np.ndarray,
+        frame: np.ndarray,
+    ) -> Tuple[Optional[float], Dict[str, Any]]:
+        """Улучшенный алгоритм измерения ширины с многострочным сканированием."""
+        if self.measure_y is None or self.measure_right is None:
+            return None, {"ok": False, "reason": "not_initialized"}
+
+        # --- Динамические границы ROI: следуем за реальным положением металла ---
+        dyn_left, dyn_right = self._compute_dynamic_bounds(hsv_mask, enhanced.shape[1])
+
+        # --- Многострочное сканирование: медиана по N строкам убирает шум одной строки ---
+        half = Config.MEASURE_SCAN_LINES // 2
+        h = enhanced.shape[0]
+        rows = range(max(0, self.measure_y - half), min(h, self.measure_y + half + 1))
+
+        left_edges_all: list = []
+        right_edges_all: list = []
+        center_roi_norm: Optional[np.ndarray] = None
+
+        for row in rows:
+            le, re, roi_norm = self._detect_edges_for_row(
+                row, hsv_mask, enhanced, dyn_left, dyn_right
+            )
+            if le is not None:
+                left_edges_all.append(le)
+            if re is not None:
+                right_edges_all.append(re)
+            if row == self.measure_y:
+                center_roi_norm = roi_norm
+
+        if len(left_edges_all) == 0 or len(right_edges_all) == 0:
             return None, {"ok": False, "reason": "edge_not_found"}
 
-        # Вычисление ширины в пикселях
+        # Медиана устойчива к выбросам отдельных строк
+        left_edge = float(np.median(left_edges_all))
+        right_edge = float(np.median(right_edges_all))
+
+        roi_norm = center_roi_norm if center_roi_norm is not None else np.array([])
+
         width_px = right_edge - left_edge
         if width_px <= 0:
             return None, {"ok": False, "reason": "invalid_width_px", "width_px": float(width_px)}
         width_mm = width_px / self.px_to_mm
 
-        # Быстрая отбраковка выбросов по сравнению с последним значением
         if self._ema_width is not None:
             if abs(width_mm - self._ema_width) > Config.MAX_OUTLIER_DELTA_MM:
                 return None, {
@@ -176,11 +231,9 @@ class ImprovedVideoProcessor:
                     "width_mm_ref": float(self._ema_width),
                 }
 
-        # Визуализация
-        left_abs = Config.MEASURE_LEFT + left_edge
-        right_abs = Config.MEASURE_LEFT + right_edge
+        left_abs = dyn_left + left_edge
+        right_abs = dyn_left + right_edge
 
-        # Рисуем точные границы
         cv2.line(
             frame,
             (int(round(left_abs)), self.measure_y - 20),
@@ -196,10 +249,9 @@ class ImprovedVideoProcessor:
             3,
         )
 
-        # Рисуем линию профиля интенсивности
-        self.draw_intensity_profile(frame, roi_norm, int(round(left_edge)), int(round(right_edge)))
+        if len(roi_norm) > 0:
+            self.draw_intensity_profile(frame, roi_norm, int(round(left_edge)), int(round(right_edge)), dyn_left)
 
-        # Сглаживание измерений: EMA + короткое среднее (устойчивость, но сохраняем "0.01")
         if self._ema_width is None:
             self._ema_width = float(width_mm)
         else:
@@ -214,16 +266,16 @@ class ImprovedVideoProcessor:
 
         self._last_edges = (float(left_edge), float(right_edge))
 
-        # Оценка "уверенности": насколько выражен градиент в найденных окнах
-        # Нормируем на максимальный |градиент| по всему профилю, чтобы значение
-        # было в диапазоне [0, 1] независимо от масштаба яркости.
-        grad = np.gradient(roi_norm)
-        max_abs_grad = float(np.max(np.abs(grad))) + 1e-9
-        lwin = slice(max(0, int(round(left_edge)) - 5), min(len(grad), int(round(left_edge)) + 6))
-        rwin = slice(max(0, int(round(right_edge)) - 5), min(len(grad), int(round(right_edge)) + 6))
-        l_strength = float(np.max(grad[lwin])) / max_abs_grad if (lwin.stop - lwin.start) > 0 else 0.0
-        r_strength = float(-np.min(grad[rwin])) / max_abs_grad if (rwin.stop - rwin.start) > 0 else 0.0
-        confidence = float(max(0.0, min(1.0, (l_strength + r_strength) / 2.0)))
+        # Оценка уверенности по центральной строке
+        confidence = 1.0
+        if len(roi_norm) > 0:
+            grad = np.gradient(roi_norm)
+            max_abs_grad = float(np.max(np.abs(grad))) + 1e-9
+            lwin = slice(max(0, int(round(left_edge)) - 5), min(len(grad), int(round(left_edge)) + 6))
+            rwin = slice(max(0, int(round(right_edge)) - 5), min(len(grad), int(round(right_edge)) + 6))
+            l_strength = float(np.max(grad[lwin])) / max_abs_grad if (lwin.stop - lwin.start) > 0 else 0.0
+            r_strength = float(-np.min(grad[rwin])) / max_abs_grad if (rwin.stop - rwin.start) > 0 else 0.0
+            confidence = float(max(0.0, min(1.0, (l_strength + r_strength) / 2.0)))
 
         if confidence < Config.MIN_CONFIDENCE_THRESHOLD:
             return None, {
@@ -239,8 +291,8 @@ class ImprovedVideoProcessor:
             "width_mm": float(smoothed_width),
             "width_mm_2dp": float(round(smoothed_width, 2)),
             "width_px": float(width_px),
-            "left_edge_px": float(left_abs),   # absolute in frame coordinates (float)
-            "right_edge_px": float(right_abs), # absolute in frame coordinates (float)
+            "left_edge_px": float(left_abs),
+            "right_edge_px": float(right_abs),
             "left_edge_px_2dp": float(round(left_abs, 2)),
             "right_edge_px_2dp": float(round(right_abs, 2)),
             "measure_y": int(self.measure_y),
@@ -248,64 +300,89 @@ class ImprovedVideoProcessor:
         }
 
     def find_edge_position(self, profile: np.ndarray, offset: int, edge_type: str = 'rising') -> Optional[float]:
-        """НОВЫЙ: Точное определение позиции границы по профилю интенсивности"""
-        if len(profile) == 0:
+        """Поиск края по пересечению порогового уровня (50% перехода).
+
+        Метод порогового пересечения устойчив для размытых и тёмных краёв:
+        точка пересечения середины склона остаётся стабильной даже при
+        плавном/неравномерном переходе, тогда как пик градиента на размытом
+        крае плоский и легко сдвигается шумом.
+        Fallback: пик градиента, если пересечение не найдено.
+        """
+        if len(profile) < 3:
             return None
 
-        # Вычисление градиента
-        gradient = np.gradient(profile)
+        # Дополнительное сглаживание в окне поиска — подавляет шум на размытом крае
+        sigma = Config.EDGE_EXTRA_SMOOTH_SIGMA
+        k = max(3, int(6 * sigma + 1) | 1)  # нечётный размер ядра
+        smooth = cv2.GaussianBlur(
+            profile.astype(np.float32).reshape(1, -1),
+            (k, 1),
+            sigma,
+        ).flatten()
+
+        lo = float(np.min(smooth))
+        hi = float(np.max(smooth))
+        if hi - lo < 0.05:
+            return None
+
+        threshold = lo + Config.EDGE_THRESHOLD_FRACTION * (hi - lo)
 
         if edge_type == 'rising':
-            # Ищем максимальный положительный градиент
-            edge_idx = np.argmax(gradient)
+            # Ищем первое пересечение снизу вверх (фон → металл)
+            for i in range(len(smooth) - 1):
+                if smooth[i] <= threshold < smooth[i + 1]:
+                    t = (threshold - float(smooth[i])) / (float(smooth[i + 1]) - float(smooth[i]) + 1e-9)
+                    return float(offset) + float(i) + t
         else:
-            # Ищем минимальный отрицательный градиент (максимальный по модулю)
-            edge_idx = np.argmin(gradient)
+            # Ищем последнее пересечение сверху вниз (металл → фон).
+            # Скан с правого конца, чтобы правый край тёмного объекта
+            # не сместил нас влево из-за провала яркости на самом крае.
+            for i in range(len(smooth) - 2, -1, -1):
+                if smooth[i] >= threshold > smooth[i + 1]:
+                    t = (float(smooth[i]) - threshold) / (float(smooth[i]) - float(smooth[i + 1]) + 1e-9)
+                    return float(offset) + float(i) + t
 
-        # Субпиксельная интерполяция для большей точности
-        if 0 < edge_idx < len(gradient) - 1:
-            # Квадратичная интерполяция (вершина параболы)
-            try:
-                y0 = float(gradient[edge_idx - 1])
-                y1 = float(gradient[edge_idx])
-                y2 = float(gradient[edge_idx + 1])
-                denom = (y0 - 2.0 * y1 + y2)
-                if denom != 0.0:
-                    delta = 0.5 * (y0 - y2) / denom
-                    edge_idx = float(edge_idx) + float(delta)
-            except Exception:
-                pass
+        # Fallback: пик градиента с субпиксельной интерполяцией
+        gradient = np.gradient(smooth)
+        edge_idx: float = float(np.argmax(gradient) if edge_type == 'rising' else np.argmin(gradient))
+        ei = int(edge_idx)
+        if 0 < ei < len(gradient) - 1:
+            y0 = float(gradient[ei - 1])
+            y1 = float(gradient[ei])
+            y2 = float(gradient[ei + 1])
+            denom = y0 - 2.0 * y1 + y2
+            if denom != 0.0:
+                edge_idx = float(ei) + 0.5 * (y0 - y2) / denom
 
         return float(offset) + float(edge_idx)
 
     def draw_intensity_profile(self, frame: np.ndarray, profile: np.ndarray,
-                             left_edge: int, right_edge: int):
+                             left_edge: int, right_edge: int,
+                             left_offset: Optional[int] = None):
         """НОВЫЙ: Визуализация профиля интенсивности"""
-        # Параметры отображения
+        x_origin = left_offset if left_offset is not None else Config.MEASURE_LEFT
+
         profile_height = 50
         profile_y_start = self.measure_y + 60
         profile_width = len(profile)
 
-        # Нормализация профиля для отображения
         if np.max(profile) > np.min(profile):
             profile_norm = (profile - np.min(profile)) / (np.max(profile) - np.min(profile))
         else:
             profile_norm = profile
 
-        # Рисуем профиль
-        for x in range(1, min(profile_width, frame.shape[1] - Config.MEASURE_LEFT)):
-            x_abs = Config.MEASURE_LEFT + x
+        for x in range(1, min(profile_width, frame.shape[1] - x_origin)):
+            x_abs = x_origin + x
             y1 = profile_y_start + int(profile_norm[x-1] * profile_height)
             y2 = profile_y_start + int(profile_norm[x] * profile_height)
             cv2.line(frame, (x_abs-1, y1), (x_abs, y2), (200, 200, 200), 1)
 
-        # Отмечаем границы на профиле
         if left_edge < len(profile_norm):
-            cv2.circle(frame, (Config.MEASURE_LEFT + left_edge,
+            cv2.circle(frame, (x_origin + left_edge,
                      profile_y_start + int(profile_norm[left_edge] * profile_height)),
                      3, (0, 255, 0), -1)
         if right_edge < len(profile_norm):
-            cv2.circle(frame, (Config.MEASURE_LEFT + right_edge,
+            cv2.circle(frame, (x_origin + right_edge,
                      profile_y_start + int(profile_norm[right_edge] * profile_height)),
                      3, (0, 255, 0), -1)
 

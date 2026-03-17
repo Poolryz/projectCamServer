@@ -4,7 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import time
-from typing import Dict, Optional
+from typing import Callable, Coroutine, Dict, Optional
 
 import requests
 from config.config import Config
@@ -37,6 +37,22 @@ class ESP8266Controller:
         self._pending: bool = False     # идёт ли прямо сейчас HTTP-запрос
         self._request_count: int = 0
 
+        # Вызывается после каждой успешной смены состояния лампы: cb(lamp_on: bool)
+        self._on_change_cb: Optional[Callable[[bool], Coroutine]] = None
+
+    # ── свойства состояния ────────────────────────────────────────────────────
+
+    @property
+    def is_on(self) -> bool:
+        """Последнее подтверждённое состояние лампы."""
+        return self._led_on
+
+    def set_on_change_callback(
+        self, cb: Callable[[bool], Coroutine]
+    ) -> None:
+        """Зарегистрировать async-колбэк, вызываемый при смене состояния лампы."""
+        self._on_change_cb = cb
+
     # ── публичный async-интерфейс ─────────────────────────────────────────────
 
     async def alert_on(self) -> None:
@@ -61,6 +77,8 @@ class ESP8266Controller:
             result = await loop.run_in_executor(_executor, self._send_request, on)
             if result["success"]:
                 self._led_on = on
+                if self._on_change_cb is not None:
+                    asyncio.create_task(self._on_change_cb(self._led_on))
         finally:
             self._pending = False
 

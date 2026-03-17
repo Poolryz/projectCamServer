@@ -204,8 +204,18 @@ async def websocket_processed(websocket: WebSocket) -> None:
     monitor = WidthMonitor()
     esp = ESP8266Controller()
 
-    # Отправляем начальное состояние монитора
+    async def _send_lamp_status(lamp_on: bool) -> None:
+        """Отправляет клиенту подтверждённое состояние лампы."""
+        await websocket.send_json({"type": "lamp_status", "lamp_on": lamp_on})
+
+    esp.set_on_change_callback(_send_lamp_status)
+
+    # Начальное состояние монитора + лампы
     await websocket.send_json({"type": "width_monitor_state", **monitor.state_dict()})
+    await websocket.send_json({"type": "lamp_status", "lamp_on": esp.is_on})
+
+    # Общий контейнер для передачи последней ширины между send_loop и receive_loop
+    shared: dict = {"last_width_mm": None}
 
     async def send_loop() -> None:
         while True:
@@ -231,6 +241,7 @@ async def websocket_processed(websocket: WebSocket) -> None:
             if isinstance(meta, dict) and meta.get("ok") is True:
                 width_mm = meta.get("width_mm")
                 if width_mm is not None:
+                    shared["last_width_mm"] = float(width_mm)
                     msg = monitor.process(float(width_mm), now)
                     if msg:
                         await websocket.send_json(msg)
@@ -239,8 +250,22 @@ async def websocket_processed(websocket: WebSocket) -> None:
                             asyncio.create_task(esp.alert_on())
                         elif msg["type"] == "width_back_in_bounds":
                             asyncio.create_task(esp.alert_off())
+                        elif msg["type"] == "width_confirm_request":
+                            # Переходим в ожидание подтверждения — лампу выключаем
+                            asyncio.create_task(esp.alert_off())
 
             await asyncio.sleep(1 / 25)
+
+    def _apply_lamp_to_current_width() -> None:
+        """Включить/выключить лампу исходя из последней измеренной ширины и новых границ."""
+        last = shared["last_width_mm"]
+        if last is None or monitor.bounds is None:
+            return
+        lo, hi = monitor.bounds
+        if lo <= last <= hi:
+            asyncio.create_task(esp.alert_off())
+        else:
+            asyncio.create_task(esp.alert_on())
 
     async def receive_loop() -> None:
         while True:
@@ -249,14 +274,18 @@ async def websocket_processed(websocket: WebSocket) -> None:
             reply: Optional[dict] = None
 
             if msg_type == "confirm_width":
+                confirmed = bool(data.get("confirmed", False))
                 reply = monitor.on_confirm(
-                    confirmed=bool(data.get("confirmed", False)),
+                    confirmed=confirmed,
                     expected_mm=data.get("expected_mm"),
                 )
+                if confirmed and monitor.state == "monitoring":
+                    _apply_lamp_to_current_width()
             elif msg_type == "set_width":
                 expected_mm = data.get("expected_mm")
                 if expected_mm is not None:
                     reply = monitor.on_set_width(float(expected_mm))
+                    _apply_lamp_to_current_width()
             elif msg_type == "reset_monitor":
                 reply = monitor.on_reset()
 
