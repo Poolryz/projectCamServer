@@ -11,8 +11,8 @@ class Config:
     SAVE_DIR = r"C:\Users\РН\Desktop\test 4\defects"
 
     # Настройки для обработки изображения - УЛУЧШЕННЫЕ
-    LOWER_METAL = np.array([0, 0, 45])
-    UPPER_METAL = np.array([0, 0, 100])
+    LOWER_METAL = np.array([0, 0, 9])
+    UPPER_METAL = np.array([0, 0, 80])
     REAL_WIDTH_MM = 222.8
     EXPECTED_WIDTH_PX = 1011
 
@@ -24,50 +24,50 @@ class Config:
 
     # НОВЫЕ ПАРАМЕТРЫ ДЛЯ УЛУЧШЕНИЯ ТОЧНОСТИ
     # Параметры для медианного фильтра (шумоподавление)
-    MEDIAN_BLUR_KERNEL = 3
+    MEDIAN_BLUR_KERNEL = 5
 
     # Параметры для CLAHE (улучшение контраста)
-    CLAHE_CLIP_LIMIT = 4.0
+    CLAHE_CLIP_LIMIT = 8.0
     CLAHE_GRID_SIZE = (8, 8)
 
     # Параметры для Canny Edge Detection
-    CANNY_THRESHOLD1 = 35
-    CANNY_THRESHOLD2 = 40
+    CANNY_THRESHOLD1 = 4
+    CANNY_THRESHOLD2 = 8
 
     # Параметры для сглаживания измерений
     WIDTH_HISTORY_SIZE = 20  # Количество кадров для усреднения
-    MIN_WIDTH_CHANGE = 0.4   # Минимальное изменение ширины для срабатывания (мм)
+    MIN_WIDTH_CHANGE = 0.8   # Минимальное изменение ширины для срабатывания (мм)
 
     # Порог пересечения для поиска края (0.5 = половина перехода металл→фон).
     # Этот метод стабилен для размытых краёв: пересечение середины склона
     # лежит на крутом участке, а не на плоской вершине пика градиента.
-    EDGE_THRESHOLD_FRACTION = 0.5
+    EDGE_THRESHOLD_FRACTION = 0.2
 
     # Дополнительное сглаживание (sigma, пиксели) окна поиска края перед
     # вычислением пересечения. Гасит шум на размытом/тёмном правом крае.
-    EDGE_EXTRA_SMOOTH_SIGMA = 2.5
+    EDGE_EXTRA_SMOOTH_SIGMA = 4.0
 
     # --- NEW: стабильное субпиксельное измерение ---
     # Окно поиска края вокруг грубой границы HSV (в пикселях ROI)
-    EDGE_SEARCH_HALF_WINDOW = 25
+    EDGE_SEARCH_HALF_WINDOW = 10
 
     # Количество строк сканирования вокруг measure_y для усреднения краёв.
     # Увеличьте, если правый край дрожит — медиана по строкам гасит шум одной строки.
-    MEASURE_SCAN_LINES = 9  # должно быть нечётным
+    MEASURE_SCAN_LINES = 3  # должно быть нечётным
 
     # Сглаживание профиля яркости вдоль линии измерения
     PROFILE_GAUSS_KERNEL = 11  # должно быть нечётным
     PROFILE_GAUSS_SIGMA = 2.0
 
     # Отбраковка выбросов (если измерение "прыгает" слишком сильно)
-    MAX_OUTLIER_DELTA_MM = 25.0
+    MAX_OUTLIER_DELTA_MM = 5.0
 
     # EMA-фильтр (0..1): больше -> быстрее реагирует, меньше -> стабильнее
-    EMA_ALPHA = 0.12
+    EMA_ALPHA = 0.05
 
     # Морфология для очистки маски (ядро NxN)
     MASK_MORPH_KERNEL = 5
 
     # Минимальная уверенность детекции краёв (0..1).
     # Кадры с confidence < порога отбрасываются как ненадёжные.
-    MIN_CONFIDENCE_THRESHOLD = 0.3
+    MIN_CONFIDENCE_THRESHOLD = 0.45
