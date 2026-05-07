@@ -11,8 +11,8 @@ class Config:
     SAVE_DIR = r"C:\Users\РН\Desktop\test 4\defects"
 
     # Настройки для обработки изображения - УЛУЧШЕННЫЕ
-    LOWER_METAL = np.array([0, 0, 45])
-    UPPER_METAL = np.array([0, 0, 100])
+    LOWER_METAL = np.array([0, 0, 0])
+    UPPER_METAL = np.array([250, 0, 0])
     REAL_WIDTH_MM = 222.8
     EXPECTED_WIDTH_PX = 1011
 

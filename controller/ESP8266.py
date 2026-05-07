@@ -30,8 +30,8 @@ class ESP8266Controller:
 
     def __init__(self, esp_ip: str = Config.ESP_IP) -> None:
         self.base_url = f"http://{esp_ip}"
-        self._url_on  = f"{self.base_url}/led/on"
-        self._url_off = f"{self.base_url}/led/off"
+        self._url_on  = f"{self.base_url}/power/on"
+        self._url_off = f"{self.base_url}/power/off"
 
         self._led_on: bool = False      # последнее подтверждённое состояние
         self._pending: bool = False     # идёт ли прямо сейчас HTTP-запрос
